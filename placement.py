@@ -44,6 +44,10 @@ from enum import IntEnum
 import torch
 import torch.optim as optim
 
+import math
+import torch.nn.functional as F
+import numpy as np
+
 
 # Feature index enums for cleaner code access
 class CellFeatureIdx(IntEnum):
@@ -246,6 +250,25 @@ def generate_placement_input(num_macros, num_std_cells):
 
 # ======= OPTIMIZATION CODE (edit this part) =======
 
+def initialize_smart_placement(cell_features, pin_features, edge_list):
+    """Initializes placement by solving a connectivity-only attraction phase."""
+    # Start all at center with tiny noise
+    N = cell_features.shape[0]
+    pos = torch.randn((N, 2)) * 0.1
+    pos.requires_grad_(True)
+
+    # Quick 50-step optimization for pure wirelength to 'cluster' components
+    opt = torch.optim.Adam([pos], lr=2.0)
+    for _ in range(50):
+        opt.zero_grad()
+        feat = cell_features.clone()
+        feat[:, 2:4] = pos
+        loss = wirelength_attraction_loss(feat, pin_features, edge_list)
+        loss.backward()
+        opt.step()
+
+    return pos.detach().requires_grad_(True)
+
 def wirelength_attraction_loss(cell_features, pin_features, edge_list):
     """Calculate loss based on total wirelength to minimize routing.
 
@@ -299,166 +322,523 @@ def wirelength_attraction_loss(cell_features, pin_features, edge_list):
     return total_wirelength / edge_list.shape[0]  # Normalize by number of edges
 
 
-def overlap_repulsion_loss(cell_features, pin_features, edge_list):
-    """Calculate loss to prevent cell overlaps.
+# Vectorized Pairwise for Small N
+def overlap_repulsion_loss(cell_features, pin_features,edge_list):
+  N = cell_features.shape[0]
+  device = cell_features.device
 
-    TODO: IMPLEMENT THIS FUNCTION
+  pos = cell_features[:, 2:4]    # (x, y)
+  dims = cell_features[:, 4:6]   # (w, h)
+  areas = cell_features[:, 0]
 
-    This is the main challenge. You need to implement a differentiable loss function
-    that penalizes overlapping cells. The loss should:
+  dist = torch.abs(pos.unsqueeze(1) - pos.unsqueeze(0))
+  min_sep = (dims.unsqueeze(1) + dims.unsqueeze(0)) * 0.5
 
-    1. Be zero when no cells overlap
-    2. Increase as overlap area increases
-    3. Use only differentiable PyTorch operations (no if statements on tensors)
-    4. Work efficiently with vectorized operations
+  # Smooth overlap per axis (softplus ~ ReLU with gradient near zero)
+  overlap_vec = F.softplus(min_sep - dist, beta=30.0)
+  overlap_area = overlap_vec[..., 0] * overlap_vec[..., 1]
 
-    HINTS:
-    - Two axis-aligned rectangles overlap if they overlap in BOTH x and y dimensions
-    - For rectangles centered at (x1, y1) and (x2, y2) with widths (w1, w2) and heights (h1, h2):
-      * x-overlap occurs when |x1 - x2| < (w1 + w2) / 2
-      * y-overlap occurs when |y1 - y2| < (h1 + h2) / 2
-    - Use torch.relu() to compute positive overlaps: overlap_x = relu((w1+w2)/2 - |x1-x2|)
-    - Overlap area = overlap_x * overlap_y
-    - Consider all pairs of cells: use broadcasting with unsqueeze
-    - Use torch.triu() to avoid counting each pair twice (only consider i < j)
-    - Normalize the loss appropriately (by number of pairs or total area)
+  weights = areas.unsqueeze(1) + areas.unsqueeze(0)
+  mask = torch.triu(torch.ones(N, N, device=device),diagonal=1)
 
-    RECOMMENDED APPROACH:
-    1. Extract positions, widths, heights from cell_features
-    2. Compute all pairwise distances using broadcasting:
-       positions_i = positions.unsqueeze(1)  # [N, 1, 2]
-       positions_j = positions.unsqueeze(0)  # [1, N, 2]
-       distances = positions_i - positions_j  # [N, N, 2]
-    3. Calculate minimum separation distances for each pair
-    4. Use relu to get positive overlap amounts
-    5. Multiply overlaps in x and y to get overlap areas
-    6. Mask to only consider upper triangle (i < j)
-    7. Sum and normalize
+  return (overlap_area * weights * mask).sum() / (N * N)
 
-    Args:
-        cell_features: [N, 6] tensor with [area, num_pins, x, y, width, height]
-        pin_features: [P, 7] tensor with pin information (not used here)
-        edge_list: [E, 2] tensor with edges (not used here)
 
-    Returns:
-        Scalar loss value (should be 0 when no overlaps exist)
+# Spatial Hashing for large N
+def overlap_repulsion_loss_lite(cell_features, pin_features, edge_list, epoch_progress=1.0, grid_bucket_size=None, max_pairs=5_000_000, device=None):
     """
+    Computes a differentiable overlap penalty. 
+    Uses Spatial Hashing for large ones.
+    """
+    if device is None:
+        device = cell_features.device
     N = cell_features.shape[0]
+
     if N <= 1:
-        return torch.tensor(0.0, requires_grad=True)
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # TODO: Implement overlap detection and loss calculation here
-    #
-    # Your implementation should:
-    # 1. Extract cell positions, widths, and heights
-    # 2. Compute pairwise overlaps using vectorized operations
-    # 3. Return a scalar loss that is zero when no overlaps exist
-    #
-    # Delete this placeholder and add your implementation:
+    x = cell_features[:, 2]
+    y = cell_features[:, 3]
+    w = cell_features[:, 4]
+    h = cell_features[:, 5]
 
-    # Placeholder - returns a constant loss (REPLACE THIS!)
-    return torch.tensor(1.0, requires_grad=True)
+    # Bucket size based on typical cell dimensions
+    # Median keeps buckets local for standard cells
+    if grid_bucket_size is None:
+        median_w = torch.median(w).item()
+        median_h = torch.median(h).item()
+        grid_bucket_size = max(1e-3, 0.5 * max(median_w, median_h))
 
+    xmin = x.min().detach()
+    ymin = y.min().detach()
+
+    bx = torch.floor((x - xmin) / grid_bucket_size).to(torch.int64)
+    by = torch.floor((y - ymin) / grid_bucket_size).to(torch.int64)
+
+    # Build bucket map 
+    buckets = {}
+    for idx, (ix, iy) in enumerate(zip(bx.cpu().tolist(), by.cpu().tolist())):
+        buckets.setdefault((ix, iy), []).append(idx)
+
+    neighbor_offsets = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),  (0, 0),  (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    ]
+
+    # Search Moore neighborhood (self + 8 neighbors) for candidate overlaps
+    pairs = []
+    for (ix, iy), indices in buckets.items():
+        neighbors = []
+        for dx, dy in neighbor_offsets:
+            neighbors.extend(buckets.get((ix + dx, iy + dy), []))
+        for i in indices:
+            for j in neighbors:
+                if j > i:
+                    pairs.append((i, j))
+        if len(pairs) > max_pairs:
+            break
+
+    if not pairs:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+
+    pairs = torch.tensor(pairs, dtype=torch.long, device=device)
+    i_idx = pairs[:, 0]
+    j_idx = pairs[:, 1]
+    dx = torch.abs(x[i_idx] - x[j_idx])
+    dy = torch.abs(y[i_idx] - y[j_idx])
+    min_sep_x = 0.5 * (w[i_idx] + w[j_idx])
+    min_sep_y = 0.5 * (h[i_idx] + h[j_idx])
+
+    overlap_x = F.softplus(min_sep_x - dx, beta=20.0)
+    overlap_y = F.softplus(min_sep_y - dy, beta=20.0)
+
+    return (overlap_x * overlap_y).sum()
+
+
+def detect_macros_by_area(cell_features, ratio_threshold=5.0, max_macros=50):
+    """
+    Detect macros by finding a large area gap.
+    Returns macro_indices, stdcell_indices
+    """
+    areas = cell_features[:, 0]  
+    sorted_idx = torch.argsort(areas, descending=True)
+    sorted_areas = areas[sorted_idx]
+
+    # Find first big ratio drop
+    ratios = sorted_areas[:-1] / (sorted_areas[1:] + 1e-9)
+
+    macro_cut = 0
+    for i, r in enumerate(ratios):
+        if r > ratio_threshold:
+            macro_cut = i + 1
+            break
+
+    macro_cut = min(macro_cut, max_macros)
+    macro_indices = sorted_idx[:macro_cut].tolist()
+    stdcell_indices = sorted_idx[macro_cut:].tolist()
+
+    return macro_indices, stdcell_indices
+
+
+def macro_cell_repulsion_loss(cell_features, macro_indices, stdcell_mask):
+    """
+    Penalize overlap between macros and standard cells.
+    """
+    device = cell_features.device
+
+    macros = cell_features[macro_indices]
+    stds = cell_features[stdcell_mask]
+
+    if macros.shape[0] == 0 or stds.shape[0] == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    mx = macros[:, 2][:, None]
+    my = macros[:, 3][:, None]
+    mw = macros[:, 4][:, None]
+    mh = macros[:, 5][:, None]
+
+    sx = stds[:, 2][None, :]
+    sy = stds[:, 3][None, :]
+    sw = stds[:, 4][None, :]
+    sh = stds[:, 5][None, :]
+
+    dx = torch.abs(mx - sx)
+    dy = torch.abs(my - sy)
+
+    min_x = 0.5 * (mw + sw)
+    min_y = 0.5 * (mh + sh)
+
+    ox = F.softplus(min_x - dx, beta=20.0)
+    oy = F.softplus(min_y - dy, beta=20.0)
+
+    overlap = ox * oy
+    return overlap.sum()
+
+
+def macro_macro_overlap_exact(cell_features, macro_indices, beta=50.0):
+    """
+    macro-macro overlap loss (NO BUCKETS).
+    """
+    device = cell_features.device
+    M = len(macro_indices)
+    if M <= 1:
+        return torch.tensor(0.0, device=device)
+
+    macros = cell_features[macro_indices]
+    x = macros[:, 2]
+    y = macros[:, 3]
+    w = macros[:, 4]
+    h = macros[:, 5]
+
+    dx = torch.abs(x.unsqueeze(0) - x.unsqueeze(1))
+    dy = torch.abs(y.unsqueeze(0) - y.unsqueeze(1))
+ 
+    min_sep_x = 0.5 * (w.unsqueeze(0) + w.unsqueeze(1))
+    min_sep_y = 0.5 * (h.unsqueeze(0) + h.unsqueeze(1))
+
+    ox = torch.nn.functional.softplus(min_sep_x - dx, beta=beta)
+    oy = torch.nn.functional.softplus(min_sep_y - dy, beta=beta)
+
+    overlap = ox * oy
+    overlap = overlap * (1.0 - torch.eye(M, device=device))  # remove self-pairs
+    mask = torch.triu(torch.ones(M, M, device=device), diagonal=1)
+    overlap = overlap * mask
+    return overlap.sum()
+
+
+def legalize_std_cells_row_based(
+    cell_features,
+    stdcell_mask,
+    macro_indices,
+    row_height=None,
+    x_margin=1e-3,
+):
+    """
+    Row-based standard-cell legalizer.
+    Y is snapped to nearest row and then FIXED
+    X is packed left-to-right per row
+    Macros are treated as obstacles
+    Guaranteed no std-std overlap
+    """
+    cf = cell_features.clone()
+    device = cf.device
+
+    std_idxs = torch.where(stdcell_mask)[0].cpu().numpy()
+    if len(std_idxs) <= 1:
+        return cf
+
+    x = cf[:, 2].cpu().numpy()
+    y = cf[:, 3].cpu().numpy()
+    w = cf[:, 4].cpu().numpy()
+    h = cf[:, 5].cpu().numpy()
+
+    # Row height
+    if row_height is None:
+        row_height = float(np.median(h[std_idxs]))
+
+    # row centers
+    ymin = float((y[std_idxs] - 0.5 * h[std_idxs]).min())
+    ymax = float((y[std_idxs] + 0.5 * h[std_idxs]).max())
+    num_rows = max(1, int(np.ceil((ymax - ymin) / row_height)))
+    row_centers = ymin + row_height * (np.arange(num_rows) + 0.5)
+
+    # Assign std cells to nearest row
+    row_bins = {r: [] for r in range(num_rows)}
+    for i in std_idxs:
+        r = int(np.argmin(np.abs(row_centers - y[i])))
+        y[i] = row_centers[r]  # SNAP Y 
+        row_bins[r].append(i)
+
+    # Precompute macro obstacles per row
+    macro_obs = {r: [] for r in range(num_rows)}
+    for mi in macro_indices:
+        mx, my, mw, mh = x[mi], y[mi], w[mi], h[mi]
+        for r, rc in enumerate(row_centers):
+            if abs(rc - my) <= (mh / 2 + row_height / 2):
+                macro_obs[r].append((mx - mw / 2, mx + mw / 2))
+
+    # Merge obstacles
+    for r in macro_obs:
+        obs = sorted(macro_obs[r])
+        merged = []
+        for a, b in obs:
+            if not merged or a > merged[-1][1]:
+                merged.append([a, b])
+            else:
+                merged[-1][1] = max(merged[-1][1], b)
+        macro_obs[r] = merged
+
+    for r, cells in row_bins.items():
+        if not cells:
+            continue
+        cells.sort(key=lambda i: x[i])
+        cursor = -1e9
+        obs = macro_obs[r]
+        obs_idx = 0
+
+        for i in cells:
+            wi = w[i]
+            while obs_idx < len(obs) and cursor + wi > obs[obs_idx][0]:
+                cursor = obs[obs_idx][1] + x_margin
+                obs_idx += 1
+
+            x[i] = max(cursor + wi / 2, x[i])
+            cursor = x[i] + wi / 2 + x_margin
+
+    cf[:, 2] = torch.tensor(x, device=device)
+    cf[:, 3] = torch.tensor(y, device=device)
+
+    return cf
+
+
+def find_overlapping_pairs_bucketed(cell_features, bucket_size=None):
+
+    cf = cell_features
+    N = cf.shape[0]
+    if N <= 1:
+        return []
+
+    x = cf[:, 2].detach()
+    y = cf[:, 3].detach()
+    w = cf[:, 4].detach()
+    h = cf[:, 5].detach()
+
+    if bucket_size is None:
+        median_w = float(torch.median(w).item())
+        median_h = float(torch.median(h).item())
+        bucket_size = max(1e-6, 0.75 * max(median_w, median_h))
+
+    xmin = float((x - 0.5 * w).min().item())
+    ymin = float((y - 0.5 * h).min().item())
+
+    # Compute bounding-box extents in bucket coordinates
+    left = (x - 0.5 * w - xmin)  # relative coord
+    right = (x + 0.5 * w - xmin)
+    bottom = (y - 0.5 * h - ymin)
+    top = (y + 0.5 * h - ymin)
+
+    bx_min = torch.floor(left / bucket_size).to(torch.int64)
+    bx_max = torch.floor(right / bucket_size).to(torch.int64)
+    by_min = torch.floor(bottom / bucket_size).to(torch.int64)
+    by_max = torch.floor(top / bucket_size).to(torch.int64)
+
+    # build bucket map
+    buckets = {}
+    for i in range(N):
+        imin = int(bx_min[i].item()); imax = int(bx_max[i].item())
+        jmin = int(by_min[i].item()); jmax = int(by_max[i].item())
+        for ix in range(imin, imax + 1):
+            for iy in range(jmin, jmax + 1):
+                key = (ix, iy)
+                if key not in buckets:
+                    buckets[key] = []
+                buckets[key].append(i)
+
+    # Collect overlapping pairs using local neighborhood checks
+    pairs_set = set()
+    for (ix, iy), ids in buckets.items():
+        # collect indices in neighbor 3x3 buckets 
+        neighbor_ids = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                neighbor_ids.extend(buckets.get((ix + dx, iy + dy), []))
+
+        if not neighbor_ids:
+            continue
+        neighbor_ids = list(set(neighbor_ids))
+
+        # Exact overlap check for candidate pairs
+        for i in ids:
+            for j in neighbor_ids:
+                if j <= i:
+                    continue
+                dxv = abs(float(x[i].item()) - float(x[j].item()))
+                dyv = abs(float(y[i].item()) - float(y[j].item()))
+                min_x = 0.5 * (float(w[i].item()) + float(w[j].item()))
+                min_y = 0.5 * (float(h[i].item()) + float(h[j].item()))
+                if (dxv < min_x) and (dyv < min_y):
+                    pairs_set.add((i, j))
+
+    # return sorted list
+    pairs = sorted(list(pairs_set))
+    return pairs
+
+
+def unique_indices_from_pairs(pairs):
+    s = set()
+    for a, b in pairs:
+        s.add(a); s.add(b)
+    return sorted(list(s))
+
+
+def exact_cleanup_on_active(cell_features, active_indices, eps=1e-2):
+    """
+    resolves overlaps deterministically by directly shifting
+    cell centers along the minimum penetration axis. It is intended to be
+    used only on a very small subset of cells (the final few overlapping
+    pairs after optimization and legalization.
+    """
+    if len(active_indices) <= 1:
+        return cell_features
+
+    cf = cell_features.clone()
+    k = len(active_indices)
+
+    xs = cf[active_indices, 2].clone()
+    ys = cf[active_indices, 3].clone()
+    ws = cf[active_indices, 4]
+    hs = cf[active_indices, 5]
+
+    # exact pairwise resolve few elements
+    for i in range(k):
+        for j in range(i + 1, k):
+            dx = xs[i] - xs[j]
+            dy = ys[i] - ys[j]
+            minx = 0.5 * (ws[i] + ws[j])
+            miny = 0.5 * (hs[i] + hs[j])
+
+            ox = (minx - torch.abs(dx)).item()
+            oy = (miny - torch.abs(dy)).item()
+
+            if ox > 0 and oy > 0:
+                if ox < oy:
+                    shift = 0.5 * ox + eps
+                    sign = 1.0 if dx >= 0 else -1.0
+                    xs[i] = xs[i] + sign * shift
+                    xs[j] = xs[j] - sign * shift
+                else:
+                    shift = 0.5 * oy + eps
+                    sign = 1.0 if dy >= 0 else -1.0
+                    ys[i] = ys[i] + sign * shift
+                    ys[j] = ys[j] - sign * shift
+
+    for ii, idx in enumerate(active_indices):
+        cf[idx, 2] = xs[ii]
+        cf[idx, 3] = ys[ii]
+
+    return cf
 
 def train_placement(
     cell_features,
     pin_features,
     edge_list,
     num_epochs=1000,
-    lr=0.01,
-    lambda_wirelength=1.0,
-    lambda_overlap=10.0,
+    lr=0.5,
+    lambda_wirelength=100.0,
+    lambda_overlap=200.0,
     verbose=True,
     log_interval=100,
 ):
-    """Train the placement optimization using gradient descent.
-
-    Args:
-        cell_features: [N, 6] tensor with cell properties
-        pin_features: [P, 7] tensor with pin properties
-        edge_list: [E, 2] tensor with edge connectivity
-        num_epochs: Number of optimization iterations
-        lr: Learning rate for Adam optimizer
-        lambda_wirelength: Weight for wirelength loss
-        lambda_overlap: Weight for overlap loss
-        verbose: Whether to print progress
-        log_interval: How often to print progress
-
-    Returns:
-        Dictionary with:
-            - final_cell_features: Optimized cell positions
-            - initial_cell_features: Original cell positions (for comparison)
-            - loss_history: Loss values over time
     """
-    # Clone features and create learnable positions
-    cell_features = cell_features.clone()
+    Performs continuous wirelength-driven placement with scalable overlap handling.
+    A final deterministic cleanup to ensure strictly zero overlaps.
+    """
+
+    device = cell_features.device
     initial_cell_features = cell_features.clone()
+    N = cell_features.shape[0]
 
-    # Make only cell positions require gradients
-    cell_positions = cell_features[:, 2:4].clone().detach()
-    cell_positions.requires_grad_(True)
+    # Detect macros
+    macro_indices, std_cell_indices = detect_macros_by_area(cell_features)
+    stdcell_mask = torch.zeros(cell_features.shape[0], dtype=torch.bool, device=device)
+    stdcell_mask[std_cell_indices] = True
 
-    # Create optimizer
-    optimizer = optim.Adam([cell_positions], lr=lr)
+    # Smart initialization (wirelength clustering only)
+    cell_positions = initialize_smart_placement(cell_features, pin_features, edge_list)
+    cell_features[:, 2:4] = cell_positions.detach()
 
-    # Track loss history
+    cell_positions = cell_features[:, 2:4].detach().clone().requires_grad_(True)
+
+    optimizer = torch.optim.AdamW([cell_positions], lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
     loss_history = {
         "total_loss": [],
         "wirelength_loss": [],
         "overlap_loss": [],
     }
 
-    # Training loop
+    # Continuous optimization loop 
     for epoch in range(num_epochs):
         optimizer.zero_grad()
 
-        # Create cell_features with current positions
-        cell_features_current = cell_features.clone()
-        cell_features_current[:, 2:4] = cell_positions
+        cur = cell_features.clone()
+        cur[:, 2:4] = cell_positions
 
-        # Calculate losses
-        wl_loss = wirelength_attraction_loss(
-            cell_features_current, pin_features, edge_list
-        )
-        overlap_loss = overlap_repulsion_loss(
-            cell_features_current, pin_features, edge_list
-        )
+        # Wirelength 
+        wl_loss = wirelength_attraction_loss(cur, pin_features, edge_list)
 
-        # Combined loss
-        total_loss = lambda_wirelength * wl_loss + lambda_overlap * overlap_loss
+        progress = epoch / num_epochs
+        progress_threshold = 0.75
 
-        # Backward pass
+        if N > 500: 
+          # split overlap losses (FAST)
+          # std–std 
+          ov_std = overlap_repulsion_loss_lite(cur[stdcell_mask], pin_features, edge_list, epoch_progress=progress,)
+
+          # macro–std 
+          ov_macro_std = macro_cell_repulsion_loss(cur, macro_indices, stdcell_mask)
+
+          # macro–macro 
+          if len(macro_indices) > 1:
+              ov_macro_macro = macro_macro_overlap_exact(cur, macro_indices)
+          else:
+              ov_macro_macro = torch.tensor(0.0, device=device)
+
+          overlap_loss = (1000 * ov_std + 100.0 * ov_macro_std + 100.0 * ov_macro_macro)
+          progress_threshold = 0.6
+
+        else:
+          overlap_loss = overlap_repulsion_loss(cur, pin_features, edge_list)
+        
+        if progress < progress_threshold:
+            cur_lambda_wl = lambda_wirelength / max(progress, 0.1)
+            cur_lambda_ov = lambda_overlap * progress
+        else:
+            cur_lambda_wl = 0.1
+            cur_lambda_ov = 10000.0
+
+        total_loss = (cur_lambda_wl * wl_loss + cur_lambda_ov * overlap_loss)
+
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_([cell_positions], 1.0)
 
-        # Gradient clipping to prevent extreme updates
-        torch.nn.utils.clip_grad_norm_([cell_positions], max_norm=5.0)
-
-        # Update positions
         optimizer.step()
+        scheduler.step()
 
-        # Record losses
         loss_history["total_loss"].append(total_loss.item())
         loss_history["wirelength_loss"].append(wl_loss.item())
         loss_history["overlap_loss"].append(overlap_loss.item())
 
-        # Log progress
         if verbose and (epoch % log_interval == 0 or epoch == num_epochs - 1):
-            print(f"Epoch {epoch}/{num_epochs}:")
-            print(f"  Total Loss: {total_loss.item():.6f}")
-            print(f"  Wirelength Loss: {wl_loss.item():.6f}")
-            print(f"  Overlap Loss: {overlap_loss.item():.6f}")
+            print(
+                f"Epoch {epoch}/{num_epochs} | "
+                f"WL: {wl_loss.item():.4f} | "
+                f"OV: {overlap_loss.item():.4f} | "
+                f"λ_ov: {cur_lambda_ov:.1f}"
+            )
 
-    # Create final cell features
-    final_cell_features = cell_features.clone()
-    final_cell_features[:, 2:4] = cell_positions.detach()
+    cell_features[:, 2:4] = cell_positions.detach()
 
+    if N > 500 : cell_features = legalize_std_cells_row_based(cell_features, stdcell_mask, macro_indices)
+
+    pairs = find_overlapping_pairs_bucketed(cell_features)
+    itr = 0
+    while pairs and itr<30:
+        itr += 1
+        active = unique_indices_from_pairs(pairs)
+        cell_features = exact_cleanup_on_active(cell_features, active, eps=5e-2)
+        cell_features = legalize_std_cells_row_based(cell_features, stdcell_mask, macro_indices)
+        pairs = find_overlapping_pairs_bucketed(cell_features)
+      
     return {
-        "final_cell_features": final_cell_features,
+        "final_cell_features": cell_features.clone(),
         "initial_cell_features": initial_cell_features,
         "loss_history": loss_history,
     }
-
-
+    
 # ======= FINAL EVALUATION CODE (Don't edit this part) =======
 
 def calculate_overlap_metrics(cell_features):
