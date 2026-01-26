@@ -3,5 +3,5 @@
 *.jpeg
 *.gif
 *.bmp
-
+*.txt
 **/__pycache__/**

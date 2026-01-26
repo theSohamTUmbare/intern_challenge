@@ -34,14 +34,18 @@ We will review submissions on a rolling basis.
 | 1    |   example       | 0.5000      | 0.5             |  10         |   example submission |
 | 2    | Add Yours!      |             |                 |             |                      |
 
-
+## Results on the New Realistic Test Cases
+| Test case | Macros | cells   | Overlap    | Wirelength (um)  | Runtime (s) | 
+|-----------|--------|---------|------------|------------------|-------------|
+| 11        | 10     | 10,000  | 0          | 0.2849           | 222.84      | 
 
 ## Leaderboard (sorted by overlap) (OLD; test suite has been updated; see above)
+*(the results updated at leaderboard are on old 10 test cases)
 
 | Rank | Name            | Overlap     | Wirelength (um) | Runtime (s) | Notes                |
 |------|-----------------|-------------|-----------------|-------------|----------------------|
 | 1    | Shashank Shriram  | 0.0000     | 0.1310          |  11.32      |   🏎️💥               |
-| 2    | Soham Umbare     | 0.0000     | 0.1990          | 32.82      |  Overlap & overlap-lite loss with deterministic cleanup  |
+| 2    | Soham Umbare     | 0.0000     | 0.2594          | 59.13      |  Overlap & overlap-lite loss with deterministic cleanup  |
 | 3    | Brayden Rudisill  | 0.0000    | 0.2611          |   50.51     |   Timed on a mac air |
 | 4    | manuhalapeth      | 0.0000    | 0.2630          |  196.8      |                      |
 | 5    | Neil Teje         | 0.0000    | 0.2700          | 24.00s      |                      |
